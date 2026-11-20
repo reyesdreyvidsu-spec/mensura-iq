@@ -17,7 +17,8 @@ No necesita instalación, servidor local ni conexión a internet.
 - **Temporizador por ítem** con anillo de cuenta atrás y avance automático al agotarse.
 - **Orden aleatorio** de las preguntas y de las opciones en cada intento.
 - **Informe**: CI estimado, percentil, IC 95 %, fiabilidad, error típico, curva de distribución, radar por dominio, barras, análisis de tiempos y revisión de respuestas con explicación.
-- **Sin guardado**: si sales o recargas, el intento se descarta y el test vuelve a empezar.
+- **Sin guardado del test en curso**: si sales o recargas, el intento se descarta y el test vuelve a empezar.
+- **Historial privado opcional**: los resultados que decidas guardar se cifran con un PIN en tu navegador. Solo se abren tocando **«© 2026 MENSURA»** en el pie de página y escribiendo el PIN.
 - **Sin red**: no se envía nada a ningún servidor. Todo ocurre en tu navegador.
 
 ## Niveles
@@ -38,6 +39,16 @@ No necesita instalación, servidor local ni conexión a internet.
 3. La habilidad `θ` se estima por **EAP** (media a posteriori esperada) con una distribución previa normal estándar.
 4. El CI se obtiene con la transformación de desviación: `CI = 100 + 15·θ`.
 5. El error típico de `θ` produce el intervalo del 95 %: `θ ± 1,96·SE(θ)`; la fiabilidad estimada es `1 − SE²`.
+
+## Historial privado
+
+Al terminar un test puedes pulsar **«Guardar resultado»** en el informe. La primera vez te pedirá crear un PIN de 4–8 dígitos; a partir de ahí los resultados se guardan cifrados con AES-256-GCM y PBKDF2 en el almacenamiento local del navegador.
+
+- Se abren desde el pie de página, tocando **«© 2026 MENSURA»** (no hay ningún botón visible de historial).
+- Cada visita pide el PIN; el PIN no se guarda en ningún sitio.
+- Los datos son privados de este navegador: no se sincronizan entre dispositivos y desaparecen si borras los datos del sitio.
+- Si olvidas el PIN, no hay recuperación posible.
+- Puedes exportar el historial a JSON (sin cifrar) o eliminar resultados concretos.
 
 ## Qué significa y qué no
 
