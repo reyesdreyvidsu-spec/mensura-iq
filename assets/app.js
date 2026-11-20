@@ -1,5 +1,5 @@
 /* =========================================================================
-   MENSURA — motor del test, puntuación e informe
+   MENSURA – motor del test, puntuación e informe
    ========================================================================= */
 (function () {
   'use strict';
@@ -8,6 +8,7 @@
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
   var $$ = function (sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); };
   var KEY = 'mensura.progress.v1';
+  var VAULT_KEY = 'mensura.vault.v1';
 
   var MODES = {
     quick: { id: 'quick', label: 'Rápido', perItem: 70, spans: 2, norm: { mean: 0.58, sd: 0.18 }, note: 'Baremo estándar' },
@@ -33,7 +34,9 @@
     tickId: null,
     spanToken: 0,
     spanInput: '',
-    result: null
+    result: null,
+    vault: null,
+    vaultTimer: null
   };
 
   /* ----------------------------- utilidades ----------------------------- */
@@ -257,7 +260,7 @@
   /* ------------------------------- vistas ------------------------------- */
   function showView(name) {
     state.view = name;
-    ['home', 'test', 'report'].forEach(function (v) {
+    ['home', 'test', 'report', 'history'].forEach(function (v) {
       var el = document.getElementById('view-' + v);
       if (!el) return;
       el.hidden = v !== name;
@@ -804,6 +807,363 @@
   }
   function closeOverlay() { $('#overlay-root').innerHTML = ''; }
 
+  /* ------------------------- historial privado -------------------------- */
+  function bytesToB64(bytes) {
+    var arr = new Uint8Array(bytes), s = '';
+    for (var i = 0; i < arr.length; i++) s += String.fromCharCode(arr[i]);
+    return btoa(s);
+  }
+  function b64ToBytes(b64) {
+    var bin = atob(b64), arr = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return arr;
+  }
+  async function deriveVaultKey(pin, salt) {
+    var base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey(
+      { name: 'PBKDF2', salt: salt, iterations: 40000, hash: 'SHA-256' },
+      base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+    );
+  }
+  async function encryptPayload(key, obj) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var data = new TextEncoder().encode(JSON.stringify(obj));
+    var ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, data);
+    return { iv: bytesToB64(iv), ct: bytesToB64(ct) };
+  }
+  async function decryptPayload(key, ivB64, ctB64) {
+    var data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(ivB64) }, key, b64ToBytes(ctB64));
+    return JSON.parse(new TextDecoder().decode(data));
+  }
+
+  function readVaultRaw() {
+    try {
+      var raw = localStorage.getItem(VAULT_KEY);
+      if (!raw) return null;
+      var o = JSON.parse(raw);
+      if (!o || !o.salt || !o.iv || !o.ct) return null;
+      return o;
+    } catch (e) { return null; }
+  }
+  function hasVault() { return !!readVaultRaw(); }
+
+  function touchVault() {
+    clearTimeout(state.vaultTimer);
+    state.vaultTimer = setTimeout(function () { lockVault(); }, 10 * 60 * 1000);
+  }
+  function lockVault() {
+    state.vault = null;
+    clearTimeout(state.vaultTimer);
+    if (state.view === 'history') renderHistory();
+  }
+  async function createVault(pin) {
+    var salt = crypto.getRandomValues(new Uint8Array(16));
+    var key = await deriveVaultKey(pin, salt);
+    var enc = await encryptPayload(key, { entries: [] });
+    localStorage.setItem(VAULT_KEY, JSON.stringify({
+      v: 1, salt: bytesToB64(salt), iv: enc.iv, ct: enc.ct, createdAt: Date.now()
+    }));
+    state.vault = { key: key, salt: salt, entries: [] };
+    touchVault();
+  }
+  async function unlockWithPin(pin) {
+    var raw = readVaultRaw();
+    if (!raw) throw new Error('sin historial');
+    var salt = b64ToBytes(raw.salt);
+    var key = await deriveVaultKey(pin, salt);
+    var payload = await decryptPayload(key, raw.iv, raw.ct);
+    state.vault = { key: key, salt: salt, entries: payload.entries || [] };
+    touchVault();
+  }
+  async function persistVault(payload) {
+    if (!state.vault || !state.vault.key) throw new Error('bloqueado');
+    var raw = readVaultRaw();
+    var saltB64 = raw ? raw.salt : bytesToB64(state.vault.salt);
+    var created = raw && raw.createdAt ? raw.createdAt : Date.now();
+    var enc = await encryptPayload(state.vault.key, payload);
+    localStorage.setItem(VAULT_KEY, JSON.stringify({
+      v: 1, salt: saltB64, iv: enc.iv, ct: enc.ct, createdAt: created, updatedAt: Date.now()
+    }));
+  }
+
+  function openPinModal(mode, onDone) {
+    if (!window.crypto || !crypto.subtle) {
+      toast('El historial cifrado necesita HTTPS. Abre la web publicada.', 'warn');
+      return;
+    }
+    var isCreate = mode === 'create';
+    var root = $('#overlay-root');
+    root.innerHTML =
+      '<div class="overlay"><div class="overlay-card pin-modal">' +
+        '<button class="method-x" data-x="cancel" aria-label="Cerrar">×</button>' +
+        '<span class="eyebrow"><i class="pulse-dot"></i> Historial privado</span>' +
+        '<h2>' + (isCreate ? 'Crea tu PIN' : 'Desbloquear historial') + '</h2>' +
+        '<p>' + (isCreate
+          ? 'Tus resultados se cifrarán con este PIN. No se guarda en ningún servidor y nadie más puede leerlos.'
+          : 'Introduce el PIN con el que cifraste tus resultados.') + '</p>' +
+        '<label class="pin-label">PIN (4–8 dígitos)' +
+          '<input id="pin1" class="pin-field" type="password" inputmode="numeric" autocomplete="' + (isCreate ? 'new-password' : 'current-password') + '" maxlength="8">' +
+        '</label>' +
+        (isCreate ? '<label class="pin-label">Repite el PIN' +
+          '<input id="pin2" class="pin-field" type="password" inputmode="numeric" autocomplete="new-password" maxlength="8"></label>' : '') +
+        '<p class="pin-error" id="pin-error"></p>' +
+        '<div class="overlay-actions">' +
+          '<button class="btn btn-outline" data-x="cancel">Cancelar</button>' +
+          '<button class="btn btn-primary" id="pin-ok">' + (isCreate ? 'Crear PIN' : 'Desbloquear') + '</button>' +
+        '</div>' +
+      '</div></div>';
+
+    var p1 = $('#pin1'), p2 = $('#pin2'), err = $('#pin-error'), ok = $('#pin-ok');
+    if (p1) p1.focus();
+    function fail(msg) { err.textContent = msg; if (p1) p1.focus(); }
+    async function submit() {
+      var pin = (p1.value || '').trim();
+      if (!/^\d{4,8}$/.test(pin)) return fail('El PIN debe tener entre 4 y 8 dígitos.');
+      if (isCreate && pin !== (p2.value || '').trim()) return fail('Los dos PIN no coinciden.');
+      ok.disabled = true; ok.textContent = 'Comprobando…';
+      try {
+        if (isCreate) await createVault(pin); else await unlockWithPin(pin);
+        closeOverlay();
+        if (onDone) onDone();
+      } catch (e) {
+        ok.disabled = false;
+        ok.textContent = isCreate ? 'Crear PIN' : 'Desbloquear';
+        fail(isCreate ? 'No se pudo crear el PIN.' : 'PIN incorrecto.');
+      }
+    }
+    ok.addEventListener('click', submit);
+    [p1, p2].forEach(function (inp) {
+      if (!inp) return;
+      inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    });
+    root.querySelectorAll('[data-x="cancel"]').forEach(function (b) { b.addEventListener('click', closeOverlay); });
+    root.querySelector('.overlay').addEventListener('click', function (e) { if (e.target === this) closeOverlay(); });
+  }
+
+  function buildHistoryEntry(r) {
+    return {
+      id: 'r-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+      date: r.date,
+      mode: r.mode,
+      modeLabel: r.modeLabel,
+      iq: r.iq,
+      percentile: r.percentile,
+      ci: r.ci,
+      band: r.band,
+      durationMs: r.durationMs,
+      theta: r.theta,
+      se: r.se,
+      reliability: r.reliability,
+      stats: {
+        correct: r.stats.correct,
+        total: r.stats.total,
+        accuracy: r.stats.accuracy,
+        avgTime: r.stats.avgTime,
+        timeouts: r.stats.timeouts,
+        consistency: r.stats.consistency
+      },
+      domains: r.domains.map(function (d) {
+        return { id: d.id, name: d.name, short: d.short, iq: d.iq, pct: d.pct, correct: d.correct, n: d.n };
+      })
+    };
+  }
+
+  async function appendResult(r) {
+    try {
+      state.vault.entries.unshift(buildHistoryEntry(r));
+      if (state.vault.entries.length > 100) state.vault.entries.length = 100;
+      await persistVault({ entries: state.vault.entries });
+      touchVault();
+      toast('Resultado guardado en tu historial privado');
+      var btn = $('#btn-save-history');
+      if (btn) { btn.textContent = 'Guardado ✓'; btn.disabled = true; }
+      if (state.view === 'history') renderHistory();
+    } catch (e) {
+      toast('No se pudo guardar el resultado', 'warn');
+    }
+  }
+
+  function saveResultToHistory(r) {
+    if (!window.crypto || !crypto.subtle) {
+      toast('El historial cifrado necesita HTTPS. Abre la web publicada.', 'warn');
+      return;
+    }
+    if (!hasVault()) {
+      openPinModal('create', function () { appendResult(r); });
+    } else if (!state.vault || !state.vault.key) {
+      openPinModal('unlock', function () { appendResult(r); });
+    } else {
+      appendResult(r);
+    }
+  }
+
+  function openHistory() {
+    if (state.view === 'test') {
+      toast('Termina o sal del test para abrir tu historial.', 'warn');
+      return;
+    }
+    showView('history');
+    renderHistory();
+  }
+
+  function historyEntryHTML(e) {
+    var date = new Date(e.date).toLocaleDateString('es-ES', { day: '2-digit', month: 'short', year: 'numeric' });
+    var pct = e.percentile >= 0.99 ? '>99' : String(Math.round(e.percentile * 100));
+    var domains = e.domains.map(function (d) {
+      var w = clamp((d.iq - 55) / 90 * 100, 3, 100);
+      return '<div class="entry-domain"><span>' + esc(d.name) + '</span><div class="entry-bar"><i style="width:' + w + '%"></i></div><b>' + d.iq + '</b></div>';
+    }).join('');
+    return '<article class="history-entry" data-id="' + esc(e.id) + '">' +
+      '<button class="entry-toggle" aria-expanded="false">' +
+        '<span class="entry-when">' + esc(date) + '<small>' + esc(e.modeLabel) + '</small></span>' +
+        '<span class="entry-score"><strong>' + e.iq + '</strong><small>CI</small></span>' +
+        '<span class="entry-band">' + esc(e.band) + '<small>percentil ' + pct + '</small></span>' +
+        '<span class="entry-ci">IC ' + e.ci[0] + '–' + e.ci[1] + '</span>' +
+        '<span class="entry-chev">⌄</span>' +
+      '</button>' +
+      '<div class="entry-detail">' +
+        '<div class="entry-facts">' +
+          '<span><b>' + e.stats.correct + '/' + e.stats.total + '</b> aciertos</span>' +
+          '<span><b>' + Math.round(e.stats.avgTime / 1000) + ' s</b> por ítem</span>' +
+          '<span><b>' + Math.round(e.reliability * 100) + '%</b> fiabilidad</span>' +
+          '<span><b>' + e.stats.consistency + '%</b> consistencia</span>' +
+        '</div>' +
+        '<div class="entry-domains">' + domains + '</div>' +
+        '<button class="btn btn-ghost btn-sm entry-del" data-del="' + esc(e.id) + '">Eliminar este resultado</button>' +
+      '</div>' +
+    '</article>';
+  }
+
+  function renderHistory() {
+    var root = $('#history-root');
+    if (!root) return;
+    if (!window.crypto || !crypto.subtle) {
+      root.innerHTML = '<div class="history"><div class="vault-gate"><div class="vault-icon">🔒</div>' +
+        '<h1>Historial privado</h1><p>Este navegador no permite el cifrado local. Abre la web publicada por HTTPS.</p>' +
+        '<button class="btn btn-primary" data-action="home">Volver al inicio</button></div></div>';
+      return;
+    }
+
+    if (!state.vault && !hasVault()) {
+      root.innerHTML = '<div class="history"><div class="vault-gate">' +
+        '<div class="vault-icon">' + lockIcon() + '</div>' +
+        '<span class="eyebrow"><i class="pulse-dot"></i> Solo para ti</span>' +
+        '<h1>Tu historial privado</h1>' +
+        '<p>Guarda tus resultados cifrados con un PIN. Solo quien lo sepa puede leerlos y no se envían a ningún servidor.</p>' +
+        '<button class="btn btn-primary btn-lg" id="vault-create">Crear PIN y empezar</button>' +
+        '<p class="vault-note">El PIN no se guarda. Si lo olvidas, los resultados no se pueden recuperar.</p>' +
+        '</div></div>';
+      root.onclick = function (e) {
+        if (e.target.closest('#vault-create')) openPinModal('create', renderHistory);
+      };
+      return;
+    }
+
+    if (!state.vault) {
+      root.innerHTML = '<div class="history"><div class="vault-gate">' +
+        '<div class="vault-icon">' + lockIcon() + '</div>' +
+        '<span class="eyebrow"><i class="pulse-dot"></i> Cifrado en este navegador</span>' +
+        '<h1>Historial bloqueado</h1>' +
+        '<p>Introduce tu PIN para ver los resultados guardados.</p>' +
+        '<div class="pin-inline"><input id="vault-pin" class="pin-field" type="password" inputmode="numeric" maxlength="8" autocomplete="current-password" placeholder="PIN"><button class="btn btn-primary" id="vault-unlock">Desbloquear</button></div>' +
+        '<p class="pin-error" id="vault-error"></p>' +
+        '<button class="btn btn-ghost btn-sm" id="vault-forgot">He olvidado el PIN</button>' +
+        '</div></div>';
+      var input = $('#vault-pin');
+      if (input) { input.focus(); input.addEventListener('keydown', function (e) { if (e.key === 'Enter') unlockInline(); }); }
+      root.onclick = function (e) {
+        if (e.target.closest('#vault-unlock')) unlockInline();
+        else if (e.target.closest('#vault-forgot')) toast('Sin el PIN no se puede recuperar. Puedes borrar los datos del sitio para empezar de cero.', 'warn');
+      };
+      return;
+    }
+
+    var entries = state.vault.entries;
+    var best = entries.reduce(function (m, e) { return Math.max(m, e.iq); }, 0);
+    var avg = entries.length ? Math.round(entries.reduce(function (s, e) { return s + e.iq; }, 0) / entries.length) : 0;
+    var list = entries.map(historyEntryHTML).join('');
+
+    root.innerHTML = '<div class="history">' +
+      '<header class="history-head">' +
+        '<div>' +
+          '<span class="eyebrow"><i class="pulse-dot"></i> Privado · cifrado AES-256</span>' +
+          '<h1>Mi historial</h1>' +
+          '<p>' + entries.length + ' resultado' + (entries.length === 1 ? '' : 's') + ' guardado' + (entries.length === 1 ? '' : 's') + ' en este dispositivo.</p>' +
+        '</div>' +
+        '<div class="history-actions">' +
+          '<button class="btn btn-outline btn-sm" id="history-export">Exportar</button>' +
+          '<button class="btn btn-ghost btn-sm" id="history-lock">Bloquear</button>' +
+        '</div>' +
+      '</header>' +
+      '<div class="history-stats">' +
+        '<div><strong>' + entries.length + '</strong><span>tests guardados</span></div>' +
+        '<div><strong>' + (best || '–') + '</strong><span>mejor CI</span></div>' +
+        '<div><strong>' + (avg || '–') + '</strong><span>media</span></div>' +
+      '</div>' +
+      (entries.length ? '<div class="history-list">' + list + '</div>' :
+        '<div class="history-empty"><p>Aún no has guardado ningún resultado.</p><p>Al terminar un test, pulsa <b>«Guardar resultado»</b> en el informe.</p><button class="btn btn-primary" id="history-start">Hacer el test</button></div>') +
+      '<p class="vault-note">Los datos están cifrados en tu navegador. Si borras los datos del sitio o cambias de dispositivo, desaparecen.</p>' +
+      '</div>';
+
+    var pinInput = $('#vault-pin');
+    if (pinInput) pinInput.focus();
+    root.onclick = function (e) {
+      var del = e.target.closest('[data-del]');
+      if (del) { deleteHistoryEntry(del.getAttribute('data-del')); return; }
+      var toggle = e.target.closest('.entry-toggle');
+      if (toggle) {
+        var art = toggle.closest('.history-entry');
+        var open = art.classList.toggle('is-open');
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        return;
+      }
+      if (e.target.closest('#history-export')) exportHistory();
+      else if (e.target.closest('#history-lock')) { lockVault(); toast('Historial bloqueado'); }
+      else if (e.target.closest('#history-start')) startFlow('full');
+    };
+  }
+
+  async function unlockInline() {
+    var input = $('#vault-pin'), err = $('#vault-error');
+    var pin = (input.value || '').trim();
+    if (!/^\d{4,8}$/.test(pin)) { err.textContent = 'Introduce un PIN de 4 a 8 dígitos.'; return; }
+    try {
+      await unlockWithPin(pin);
+      renderHistory();
+    } catch (e) {
+      err.textContent = 'PIN incorrecto.';
+      input.select();
+    }
+  }
+
+  function exportHistory() {
+    if (!state.vault) return;
+    var blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), entries: state.vault.entries }, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'mensura-historial.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+    toast('Historial exportado sin cifrar. Guárdalo en un lugar seguro.', 'warn');
+  }
+
+  async function deleteHistoryEntry(id) {
+    if (!state.vault) return;
+    if (!window.confirm('¿Eliminar este resultado del historial?')) return;
+    state.vault.entries = state.vault.entries.filter(function (e) { return e.id !== id; });
+    try {
+      await persistVault({ entries: state.vault.entries });
+      renderHistory();
+      toast('Resultado eliminado');
+    } catch (e) { toast('No se pudo eliminar', 'warn'); }
+  }
+
+  function lockIcon() {
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 10V7.5a4 4 0 0 1 8 0V10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="15" r="1.3" fill="currentColor"/></svg>';
+  }
+
   /* ----------------------------- metodología ---------------------------- */
   function openMethod() {
     var root = $('#overlay-root');
@@ -812,7 +1172,7 @@
         '<button class="method-x" data-x="close" aria-label="Cerrar">×</button>' +
         '<span class="eyebrow"><i class="pulse-dot"></i> Transparencia psicométrica</span>' +
         '<h2>Metodología</h2>' +
-        '<p class="method-lead">Cómo se pasa de tus respuestas a un número, qué significa ese número y —igual de importante— qué no significa.</p>' +
+        '<p class="method-lead">Cómo se pasa de tus respuestas a un número, qué significa ese número y –igual de importante– qué no significa.</p>' +
         '<div class="method-body">' +
           '<h3>1 · La escala: CI de desviación</h3>' +
           '<p>El CI moderno no es una razón entre edad mental y cronológica: es una <b>puntuación de desviación</b> introducida por David Wechsler en 1939. Se define como <b>CI = 100 + 15·z</b>, donde <i>z</i> es la posición del sujeto medida en desviaciones típicas. Por construcción, la media es 100 y la desviación típica 15: aproximadamente dos tercios de la población quedan entre 85 y 115, y el 95 % entre 70 y 130 (APA, 2018).</p>' +
@@ -832,7 +1192,7 @@
             '<li><b>No hay baremo por edad ni muestra normativa propia.</b> La referencia es la distribución teórica N(100, 15); la dificultad de los ítems está calibrada por diseño, no empíricamente.</li>' +
             '<li><b>El entorno importa.</b> Fatiga, sueño, práctica previa, pantalla y prisa mueven la puntuación varios puntos.</li>' +
             '<li><b>Carga cultural y educativa.</b> El vocabulario y ciertos formatos favorecen a quienes han tenido más exposición a ese tipo de tareas.</li>' +
-            '<li><b>No existe un test de CI «oficial de Harvard».</b> Las universidades investigan y enseñan psicometría —el curso 9.00 del MIT es un buen ejemplo—, pero los tests clínicos como el WAIS son propiedad de editoriales y se administran individualmente.</li>' +
+            '<li><b>No existe un test de CI «oficial de Harvard».</b> Las universidades investigan y enseñan psicometría –el curso 9.00 del MIT es un buen ejemplo–, pero los tests clínicos como el WAIS son propiedad de editoriales y se administran individualmente.</li>' +
           '</ul>' +
 
           '<h3>5 · Fuentes</h3>' +
@@ -1143,6 +1503,7 @@
           '</div>' +
           '<div class="report-actions">' +
             '<button class="btn btn-ghost btn-sm" id="btn-copy">Copiar resultado</button>' +
+            '<button class="btn btn-outline btn-sm" id="btn-save-history">Guardar resultado</button>' +
             '<button class="btn btn-outline btn-sm" id="btn-print">Descargar PDF</button>' +
             '<button class="btn btn-primary btn-sm" id="btn-repeat">Repetir test</button>' +
           '</div>' +
@@ -1214,6 +1575,7 @@
     updateProgress();
 
     $('#btn-print').addEventListener('click', function () { window.print(); });
+    $('#btn-save-history').addEventListener('click', function () { saveResultToHistory(r); });
     $('#btn-repeat').addEventListener('click', function () { startFlow(r.mode); });
     $('#btn-copy').addEventListener('click', function () {
       var text = 'MENSURA · Test cognitivo\nCI estimado: ' + r.iq + ' (' + r.band + ')\nPercentil: ' + pctText + '\nIC 95 %: ' + r.ci[0] + '–' + r.ci[1] + '\nModo: ' + r.modeLabel;
@@ -1265,6 +1627,9 @@
       } else if (action === 'method') {
         e.preventDefault();
         openMethod();
+      } else if (action === 'history') {
+        e.preventDefault();
+        openHistory();
       } else if (action === 'legal') {
         e.preventDefault();
         toast('Documento no incluido en esta versión de demostración.');
@@ -1319,31 +1684,8 @@
     var query = window.location.search;
     if (!query && window.location.hash) query = '?' + window.location.hash.replace(/^#/, '');
     var params = new URLSearchParams(query);
-    if (params.get('qa') || params.get('demo') === 'report') document.body.classList.add('no-anim');
+    if (params.get('demo') === 'report') document.body.classList.add('no-anim');
     if (params.get('demo') === 'report') { startDemo(true); return; }
-    var qa = params.get('qa');
-    if (qa === 'intro') { startFlow('full'); return; }
-    if (qa === 'method') { openMethod(); return; }
-    if (qa === 'word') { state.mode = 'full'; showView('test'); beginWordStage(); return; }
-    if (qa) {
-      state.mode = 'full';
-      state.wordData = DATA.wordPool[0];
-      state.items = buildItems('full', state.wordData);
-      state.answers = [];
-      state.startedAt = Date.now();
-      state.index = 0;
-      if (qa === 'span') {
-        state.index = state.items.findIndex(function (i) { return i.kind === 'span'; });
-        if (state.index < 0) state.index = 0;
-      } else if (qa === 'matrix') {
-        state.index = state.items.findIndex(function (i) { return i.domain === 'matrices'; });
-        if (state.index < 0) state.index = 0;
-      }
-      showView('test');
-      renderQuestion();
-      startTick();
-      return;
-    }
     renderResumeBar();
   }
 
@@ -1361,3 +1703,6 @@
     normalCdf: normalCdf
   };
 })();
+
+
+
